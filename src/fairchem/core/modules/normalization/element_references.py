@@ -134,6 +134,7 @@ class LinearReferences(nn.Module):
 
     @torch.autocast(device_type="cuda", enabled=False)
     @torch.autocast(device_type="cpu", enabled=False)
+    @torch.autocast(device_type="xpu", enabled=False)
     def dereference(
         self, target: torch.Tensor, batch: AtomicData, reshaped: bool = True
     ) -> torch.Tensor:
@@ -142,6 +143,7 @@ class LinearReferences(nn.Module):
 
     @torch.autocast(device_type="cuda", enabled=False)
     @torch.autocast(device_type="cpu", enabled=False)
+    @torch.autocast(device_type="xpu", enabled=False)
     def forward(
         self, target: torch.Tensor, batch: AtomicData, reshaped: bool = True
     ) -> torch.Tensor:

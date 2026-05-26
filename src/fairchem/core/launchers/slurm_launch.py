@@ -63,13 +63,13 @@ def _get_slurm_env() -> SlurmEnv:
 
 def map_job_config_to_dist_config(job_cfg: JobConfig) -> dict:
     scheduler_config = job_cfg.scheduler
+    device_type = job_cfg.device_type.value
     return {
         "world_size": scheduler_config.num_nodes * scheduler_config.ranks_per_node,
-        "distributed_backend": (
-            "gloo" if job_cfg.device_type == DeviceType.CPU else "nccl"
-        ),
+        "distributed_backend": distutils._distributed_backend_for(device_type),
         "submit": scheduler_config.mode == SchedulerType.SLURM,
         "cpu": job_cfg.device_type == DeviceType.CPU,
+        "device_type": device_type,
         "init_method": scheduler_config.distributed_init_method,
         # for distributed shared file initialization
         "shared_file_dir": os.path.join(job_cfg.run_dir, job_cfg.timestamp_id),
@@ -100,6 +100,8 @@ def _set_seeds(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.manual_seed_all(seed)
 
 
 def _set_deterministic_mode() -> None:

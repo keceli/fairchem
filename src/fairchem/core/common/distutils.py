@@ -118,10 +118,12 @@ def setup(config) -> None:
                     f"local rank: {local_rank}, visible devices: {os.environ.get('CUDA_VISIBLE_DEVICES', 'None')}"
                 )
 
-                assign_device_for_local_rank(config["cpu"], local_rank)
+                assign_device_for_local_rank(
+                    config["cpu"], local_rank, config.get("device_type")
+                )
 
                 dist.init_process_group(
-                    backend="nccl",
+                    backend=config.get("distributed_backend", "nccl"),
                     init_method=init_method,
                     timeout=timeout,
                 )
@@ -133,7 +135,9 @@ def setup(config) -> None:
         if config.get("init_method") == "file":
             local_rank = int(os.environ.get("LOCAL_RANK", 0))
             rank = int(os.environ.get("RANK", 0))
-            assign_device_for_local_rank(config["cpu"], local_rank)
+            assign_device_for_local_rank(
+                config["cpu"], local_rank, config.get("device_type")
+            )
             assert os.path.isdir(config["shared_file_dir"])
             shared_filename = os.path.join(
                 config["shared_file_dir"],
@@ -155,7 +159,9 @@ def setup(config) -> None:
                 ), "Can only setup master address and port at this point for a single rank, otherwise we assume the processes and the comm addr/port have already been setup"
                 setup_env_local()
             local_rank = int(os.environ["LOCAL_RANK"])
-            assign_device_for_local_rank(config["cpu"], local_rank)
+            assign_device_for_local_rank(
+                config["cpu"], local_rank, config.get("device_type")
+            )
 
             dist.init_process_group(
                 backend=config["distributed_backend"],
@@ -268,34 +274,104 @@ def gather_objects(data: T, group: dist.ProcessGroup = dist.group.WORLD) -> list
     return output
 
 
-def assign_device_for_local_rank(cpu: bool, local_rank: int) -> None:
+def _accelerator_module(device_type: str):
+    """
+    Return the torch accelerator module (torch.cuda, torch.xpu) for the
+    given device-type string. Raises for ``cpu``.
+    """
+    if device_type == "cuda":
+        return torch.cuda
+    if device_type == "xpu":
+        return torch.xpu
+    raise ValueError(f"No accelerator module for device type: {device_type}")
+
+
+def _accelerator_available(device_type: str) -> bool:
+    if device_type == "cpu":
+        return True
+    if device_type == "cuda":
+        return torch.cuda.is_available()
+    if device_type == "xpu":
+        return hasattr(torch, "xpu") and torch.xpu.is_available()
+    return False
+
+
+def _distributed_backend_for(device_type: str) -> str:
+    """
+    Return the appropriate ``torch.distributed`` backend name for a device
+    type. CUDA -> ``nccl``, XPU -> ``xccl`` (PyTorch >= 2.7; fall back to
+    ``ccl`` if the older ``oneccl_bindings_for_pytorch`` package is in use),
+    CPU -> ``gloo``.
+    """
+    if device_type == "cuda":
+        return "nccl"
+    if device_type == "xpu":
+        if dist.is_backend_available("xccl"):
+            return "xccl"
+        return "ccl"
+    return "gloo"
+
+
+def _auto_detect_device_type() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
+    return "cpu"
+
+
+def assign_device_for_local_rank(
+    cpu: bool, local_rank: int, device_type: str | None = None
+) -> None:
+    """
+    Assign and record the active device for the local rank.
+
+    ``cpu=True`` forces CPU. Otherwise ``device_type`` (if given) selects the
+    accelerator (``cuda`` / ``xpu``); when omitted, the first available
+    accelerator is used (cuda preferred over xpu).
+    """
     if cpu:
         os.environ[CURRENT_DEVICE_TYPE_STR] = "cpu"
-    else:
-        assert torch.cuda.is_available(), "cannot set cpu=false and no cuda available!"
-        os.environ[CURRENT_DEVICE_TYPE_STR] = "cuda"
-        torch.cuda.set_device(local_rank)
+        return
+
+    if device_type is None:
+        device_type = _auto_detect_device_type()
+        if device_type == "cpu":
+            raise AssertionError(
+                "cannot set cpu=false and no cuda/xpu accelerator available!"
+            )
+
+    assert _accelerator_available(
+        device_type
+    ), f"requested device_type={device_type} is not available"
+    os.environ[CURRENT_DEVICE_TYPE_STR] = device_type
+    _accelerator_module(device_type).set_device(local_rank)
 
 
 def get_device_for_local_rank() -> str:
     if os.environ.get(CURRENT_DEVICE_TYPE_STR) is None:
-        os.environ[CURRENT_DEVICE_TYPE_STR] = (
-            f"cuda:{torch.cuda.current_device()}"
-            if torch.cuda.is_available()
-            else "cpu"
-        )
+        detected = _auto_detect_device_type()
+        if detected == "cpu":
+            os.environ[CURRENT_DEVICE_TYPE_STR] = "cpu"
+        else:
+            mod = _accelerator_module(detected)
+            os.environ[CURRENT_DEVICE_TYPE_STR] = f"{detected}:{mod.current_device()}"
         logging.warning(
             f"WARNING: assign_device_for_local_rank was never called, automatically defaulting to using {os.environ[CURRENT_DEVICE_TYPE_STR]}"
         )
         return os.environ[CURRENT_DEVICE_TYPE_STR]
 
-    if "cuda" in os.environ[CURRENT_DEVICE_TYPE_STR]:
+    current = os.environ[CURRENT_DEVICE_TYPE_STR]
+    if "cuda" in current:
         assert torch.cuda.is_available(), "cannot set cpu=false and no cuda available!"
         return f"cuda:{torch.cuda.current_device()}"
-    elif os.environ[CURRENT_DEVICE_TYPE_STR] == "cpu":
+    if "xpu" in current:
+        assert hasattr(torch, "xpu"), "torch.xpu module not available!"
+        assert torch.xpu.is_available(), "device set to xpu but xpu is not available!"
+        return f"xpu:{torch.xpu.current_device()}"
+    if current == "cpu":
         return "cpu"
-    else:
-        raise ValueError(f"unsupported device type: {CURRENT_DEVICE_TYPE_STR}")
+    raise ValueError(f"unsupported device type: {current}")
 
 
 def setup_env_local():

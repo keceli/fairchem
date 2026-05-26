@@ -64,12 +64,20 @@ def pytest_configure(config):
     )
 
 
+def _any_accelerator_available() -> bool:
+    return torch.cuda.is_available() or (
+        hasattr(torch, "xpu") and torch.xpu.is_available()
+    )
+
+
 def pytest_runtest_setup(item):
     # Check if the test has the 'gpu' marker
-    if "gpu" in item.keywords and not torch.cuda.is_available():
-        pytest.skip("CUDA not available, skipping GPU test")
-    if "compile_gpu" in item.keywords and not torch.cuda.is_available():
-        pytest.skip("CUDA not available, skipping compile_gpu test")
+    if "gpu" in item.keywords and not _any_accelerator_available():
+        pytest.skip("No GPU accelerator (CUDA/XPU) available, skipping GPU test")
+    if "compile_gpu" in item.keywords and not _any_accelerator_available():
+        pytest.skip(
+            "No GPU accelerator (CUDA/XPU) available, skipping compile_gpu test"
+        )
     if "dgl" in item.keywords:
         # check dgl is installed
         fairchem_cpp_found = False
@@ -113,6 +121,8 @@ def seed_everywhere(seed=0):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.manual_seed_all(seed)
 
 
 def _memory_summary() -> str:
@@ -120,6 +130,19 @@ def _memory_summary() -> str:
     if torch.cuda.is_available():
         free_gpu, total_gpu = torch.cuda.mem_get_info()
         parts.append(f"GPU free {free_gpu / 1024**3:.2f}/{total_gpu / 1024**3:.2f} GB")
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        # torch.xpu lacks mem_get_info; report allocator stats instead.
+        try:
+            free_xpu, total_xpu = torch.xpu.mem_get_info()
+            parts.append(
+                f"XPU free {free_xpu / 1024**3:.2f}/{total_xpu / 1024**3:.2f} GB"
+            )
+        except (AttributeError, RuntimeError):
+            allocated = torch.xpu.memory_allocated() / 1024**3
+            reserved = torch.xpu.memory_reserved() / 1024**3
+            parts.append(
+                f"XPU allocated {allocated:.2f} GB, reserved {reserved:.2f} GB"
+            )
     import psutil
 
     vm = psutil.virtual_memory()
@@ -162,11 +185,15 @@ def compile_reset_state():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.empty_cache()
     yield
     torch.compiler.reset()
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.empty_cache()
 
 
 @pytest.fixture(scope="session")

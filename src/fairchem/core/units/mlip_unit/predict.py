@@ -31,6 +31,7 @@ from torchtnt.framework import PredictUnit, State
 from fairchem.core.common import gp_utils
 from fairchem.core.common.distutils import (
     CURRENT_DEVICE_TYPE_STR,
+    _distributed_backend_for,
     assign_device_for_local_rank,
     get_device_for_local_rank,
     setup_env_local_multi_gpu,
@@ -220,6 +221,8 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         np.random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            torch.xpu.manual_seed_all(seed)
 
     def _setup_refs(self, atom_refs: dict | None, form_elem_refs: dict | None) -> None:
         """
@@ -244,8 +247,12 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         """
         Setup inference device.
         """
-        assert device in ["cpu", "cuda"], "device must be either 'cpu' or 'cuda'"
-        self.device = get_device_for_local_rank() if device == "cuda" else "cpu"
+        assert device in [
+            "cpu",
+            "cuda",
+            "xpu",
+        ], "device must be one of 'cpu', 'cuda', or 'xpu'"
+        self.device = get_device_for_local_rank() if device != "cpu" else "cpu"
 
     def _build_overrides_from_settings(
         self,
@@ -564,8 +571,8 @@ class MLIPWorkerLocal:
         setup_env_local_multi_gpu(self.worker_id, self.master_port, self.master_address)
 
         device = self.predictor_config.get("device", "cpu")
-        assign_device_for_local_rank(device == "cpu", 0)
-        backend = "gloo" if device == "cpu" else "nccl"
+        assign_device_for_local_rank(device == "cpu", 0, device)
+        backend = _distributed_backend_for(device)
         dist.init_process_group(
             backend=backend,
             rank=self.worker_id,
@@ -684,11 +691,16 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
         )
 
         # first create one placement group for each node
-        num_gpu_per_worker = 1 if device == "cuda" else 0
+        # TODO: Ray models XPU as a custom resource (e.g. "XPU"), not "GPU".
+        # For now we treat XPU like CUDA at the placement-group level so workers
+        # are still pinned to one accelerator; revisit when a proper Intel-GPU
+        # Ray resource pattern is wired into the cluster config.
+        is_accelerator = device in ("cuda", "xpu")
+        num_gpu_per_worker = 1 if is_accelerator else 0
         placement_groups = []
         for workers in num_workers_on_node_array:
             bundle = {"CPU": workers}
-            if device == "cuda":
+            if is_accelerator:
                 bundle["GPU"] = workers
             pg = ray.util.placement_group([bundle], strategy="STRICT_PACK")
             placement_groups.append(pg)
